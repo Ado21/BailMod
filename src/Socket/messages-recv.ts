@@ -1206,6 +1206,30 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 		}
 
+		// --- COMIENZO DEL FIX PARA JID/PN ---
+		// Esta seccion convierte automaticamente LIDs a PNs en la llave del mensaje
+		if (msg.key) {
+			if (isLidUser(msg.key.remoteJid)) {
+				const pn = await signalRepository.lidMapping.getPNForLID(msg.key.remoteJid!)
+				if (pn) {
+					logger.debug({ lid: msg.key.remoteJid, pn }, 'Replacing remoteJid LID with PN')
+					msg.key.remoteJid = pn
+					// Si es un chat individual y el participant es null o igual al remote, ajustamos
+					if (!msg.key.participant) {
+						// En chats privados, el participant suele ser undefined
+					}
+				}
+			}
+			if (isLidUser(msg.key.participant)) {
+				const pn = await signalRepository.lidMapping.getPNForLID(msg.key.participant!)
+				if (pn) {
+					logger.debug({ lid: msg.key.participant, pn }, 'Replacing participant LID with PN')
+					msg.key.participant = pn
+				}
+			}
+		}
+		// --- FIN DEL FIX PARA JID/PN ---
+
 		if (msg.key?.remoteJid && msg.key?.id && messageRetryManager) {
 			messageRetryManager.addRecentMessage(msg.key.remoteJid, msg.key.id, msg.message!)
 			logger.debug(
@@ -1344,15 +1368,29 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 
 		const callId = infoChild.attrs['call-id']!
-		const from = infoChild.attrs.from! || infoChild.attrs['call-creator']!
+		let from = infoChild.attrs.from! || infoChild.attrs['call-creator']!
+
+		// --- FIX CALL LID TO PN ---
+		if (isLidUser(from)) {
+			const pn = await signalRepository.lidMapping.getPNForLID(from)
+			if (pn) {
+				from = pn
+			}
+		}
+		// --------------------------
 
 		const call: WACallEvent = {
-			chatId: attrs.from!,
+			chatId: attrs.from!, // Nota: en llamadas grupales esto es el groupJid, en individuales puede ser LID
 			from,
 			id: callId,
 			date: new Date(+attrs.t! * 1000),
 			offline: !!attrs.offline,
 			status
+		}
+		// Fix para chatId si es LID
+		if (isLidUser(call.chatId)) {
+			const pn = await signalRepository.lidMapping.getPNForLID(call.chatId)
+			if (pn) call.chatId = pn
 		}
 
 		if (status === 'offer') {
