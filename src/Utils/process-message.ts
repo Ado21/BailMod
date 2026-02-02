@@ -585,7 +585,7 @@ const processMessage = async (
 				emitGroupRequestJoin(participant, action, method)
 				break
 		}
-	} /*  else if(content?.pollUpdateMessage) {
+	} /* else if(content?.pollUpdateMessage) {
 		const creationMsgKey = content.pollUpdateMessage.pollCreationMessageKey!
 		// we need to fetch the poll creation message to get the poll enc key
 		// TODO: make standalone, remove getMessage reference
