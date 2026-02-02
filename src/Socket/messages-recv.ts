@@ -1209,7 +1209,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// --- COMIENZO DEL FIX PARA JID/PN ---
 		// Esta seccion convierte automaticamente LIDs a PNs en la llave del mensaje
 		if (msg.key) {
-			if (isLidUser(msg.key.remoteJid)) {
+			// El uso de "|| undefined" corrige el error de tipo con "null"
+			if (isLidUser(msg.key.remoteJid || undefined)) {
 				const pn = await signalRepository.lidMapping.getPNForLID(msg.key.remoteJid!)
 				if (pn) {
 					logger.debug({ lid: msg.key.remoteJid, pn }, 'Replacing remoteJid LID with PN')
@@ -1220,7 +1221,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					}
 				}
 			}
-			if (isLidUser(msg.key.participant)) {
+			// El uso de "|| undefined" corrige el error de tipo con "null"
+			if (isLidUser(msg.key.participant || undefined)) {
 				const pn = await signalRepository.lidMapping.getPNForLID(msg.key.participant!)
 				if (pn) {
 					logger.debug({ lid: msg.key.participant, pn }, 'Replacing participant LID with PN')
