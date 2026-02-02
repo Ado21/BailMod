@@ -660,78 +660,160 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			})
 		}
 
-		await authState.keys.transaction(async () => {
-			const mediaType = getMediaType(message)
-			if (mediaType) {
-				extraAttrs['mediatype'] = mediaType
+		const mediaType = getMediaType(message)
+		if (mediaType) {
+			extraAttrs['mediatype'] = mediaType
+		}
+
+		if (normalizeMessageContent(message)?.pinInChatMessage || normalizeMessageContent(message)?.reactionMessage) {
+			extraAttrs['decrypt-fail'] = 'hide'
+		}
+
+		// FAST-TRACK: NEWSLETTER
+		// Newsletters do not require E2E encryption in the traditional sense, send immediately
+		if (isNewsletter) {
+			const patched = patchMessageBeforeSending ? await patchMessageBeforeSending(message, []) : message
+			const bytes = encodeNewsletterMessage(patched as proto.IMessage)
+			binaryNodeContent.push({
+				tag: 'plaintext',
+				attrs: {},
+				content: bytes
+			})
+			const stanza: BinaryNode = {
+				tag: 'message',
+				attrs: {
+					to: jid,
+					id: msgId,
+					type: getMessageType(message),
+					...(additionalAttributes || {})
+				},
+				content: binaryNodeContent
+			}
+			logger.debug({ msgId }, `sending newsletter message to ${jid}`)
+			await sendNode(stanza)
+			return msgId
+		}
+
+		// --- PHASE 1: NETWORK PREPARATION (NON-BLOCKING) ---
+		// Fetch metadata, devices, and check sessions BEFORE locking the database transaction
+		// This drastically improves throughput by not holding the DB lock during network I/O
+
+		let groupData: any = undefined
+		let senderKeyMap: any = {}
+
+		if (isGroupOrStatus && !isRetryResend) {
+			;[groupData, senderKeyMap] = await Promise.all([
+				(async () => {
+					let groupData =
+						useCachedGroupMetadata && cachedGroupMetadata ? await cachedGroupMetadata(jid) : undefined
+					if (groupData && Array.isArray(groupData?.participants)) {
+						logger.trace({ jid, participants: groupData.participants.length }, 'using cached group metadata')
+					} else if (!isStatus) {
+						groupData = await groupMetadata(jid)
+					}
+
+					return groupData
+				})(),
+				(async () => {
+					if (!participant && !isStatus) {
+						const result = await authState.keys.get('sender-key-memory', [jid])
+						return result[jid] || {}
+					}
+
+					return {}
+				})()
+			])
+
+			const participantsList = groupData ? groupData.participants.map((p: any) => p.id) : []
+
+			if (isStatus && statusJidList) {
+				participantsList.push(...statusJidList)
 			}
 
-			if (isNewsletter) {
-				const patched = patchMessageBeforeSending ? await patchMessageBeforeSending(message, []) : message
-				const bytes = encodeNewsletterMessage(patched as proto.IMessage)
-				binaryNodeContent.push({
-					tag: 'plaintext',
-					attrs: {},
-					content: bytes
+			// Fetch devices (Network I/O)
+			const additionalDevices = await getUSyncDevices(participantsList, !!useUserDevicesCache, false)
+			devices.push(...additionalDevices)
+		} else if (!isRetryResend) {
+			// PEER MESSAGING (1:1) preparation
+			// ADDRESSING CONSISTENCY: Match own identity to conversation context
+			let ownId = meId
+			if (isLid && meLid) {
+				ownId = meLid
+			}
+
+			const { user: ownUser } = jidDecode(ownId)!
+
+			// Add target device placeholder
+			const targetUserServer = isLid ? 'lid' : 's.whatsapp.net'
+			devices.push({
+				user,
+				device: 0,
+				jid: jidEncode(user, targetUserServer, 0)
+			})
+
+			// Add own device placeholder if self-message
+			if (user !== ownUser) {
+				const ownUserServer = isLid ? 'lid' : 's.whatsapp.net'
+				const ownUserForAddressing = isLid && meLid ? jidDecode(meLid)!.user : jidDecode(meId)!.user
+
+				devices.push({
+					user: ownUserForAddressing,
+					device: 0,
+					jid: jidEncode(ownUserForAddressing, ownUserServer, 0)
 				})
-				const stanza: BinaryNode = {
-					tag: 'message',
-					attrs: {
-						to: jid,
-						id: msgId,
-						type: getMessageType(message),
-						...(additionalAttributes || {})
-					},
-					content: binaryNodeContent
-				}
-				logger.debug({ msgId }, `sending newsletter message to ${jid}`)
-				await sendNode(stanza)
-				return
 			}
 
-			if (normalizeMessageContent(message)?.pinInChatMessage || normalizeMessageContent(message)?.reactionMessage) {
-				extraAttrs['decrypt-fail'] = 'hide' // todo: expand for reactions and other types
-			}
+			// If not a peer message (normal chat), ensure we have all devices
+			if (additionalAttributes?.['category'] !== 'peer') {
+				devices.length = 0 // Clear placeholders
 
+				const senderIdentity =
+					isLid && meLid
+						? jidEncode(jidDecode(meLid)?.user!, 'lid', undefined)
+						: jidEncode(jidDecode(meId)?.user!, 's.whatsapp.net', undefined)
+
+				// Fetch 1:1 sessions (Network I/O)
+				const sessionDevices = await getUSyncDevices([senderIdentity, jid], true, false)
+				devices.push(...sessionDevices)
+			}
+		}
+
+		// Ensure sessions exist for all recipients (Network I/O)
+		const allRecipients: string[] = []
+		const meRecipients: string[] = []
+		const otherRecipients: string[] = []
+		const { user: mePnUser } = jidDecode(meId)!
+		const { user: meLidUser } = meLid ? jidDecode(meLid)! : { user: null }
+
+		for (const { user, jid } of devices) {
+			const isExactSenderDevice = jid === meId || (meLid && jid === meLid)
+			if (isExactSenderDevice) {
+				continue
+			}
+			const isMe = user === mePnUser || user === meLidUser
+			if (isMe) {
+				meRecipients.push(jid)
+			} else {
+				otherRecipients.push(jid)
+			}
+			allRecipients.push(jid)
+		}
+
+		// Assert sessions (Network I/O)
+		await assertSessions(allRecipients)
+
+		// --- PHASE 2: TRANSACTION & ENCRYPTION (ATOMIC, FAST) ---
+		// We now have all data. Lock the DB, encrypt, and commit.
+		// This block should be as fast as possible.
+
+		const stanza = await authState.keys.transaction(async () => {
 			if (isGroupOrStatus && !isRetryResend) {
-				const [groupData, senderKeyMap] = await Promise.all([
-					(async () => {
-						let groupData = useCachedGroupMetadata && cachedGroupMetadata ? await cachedGroupMetadata(jid) : undefined // todo: should we rely on the cache specially if the cache is outdated and the metadata has new fields?
-						if (groupData && Array.isArray(groupData?.participants)) {
-							logger.trace({ jid, participants: groupData.participants.length }, 'using cached group metadata')
-						} else if (!isStatus) {
-							groupData = await groupMetadata(jid) // TODO: start storing group participant list + addr mode in Signal & stop relying on this
-						}
-
-						return groupData
-					})(),
-					(async () => {
-						if (!participant && !isStatus) {
-							// what if sender memory is less accurate than the cached metadata
-							// on participant change in group, we should do sender memory manipulation
-							const result = await authState.keys.get('sender-key-memory', [jid]) // TODO: check out what if the sender key memory doesn't include the LID stuff now?
-							return result[jid] || {}
-						}
-
-						return {}
-					})()
-				])
-
-				const participantsList = groupData ? groupData.participants.map(p => p.id) : []
-
 				if (groupData?.ephemeralDuration && groupData.ephemeralDuration > 0) {
 					additionalAttributes = {
 						...additionalAttributes,
 						expiration: groupData.ephemeralDuration.toString()
 					}
 				}
-
-				if (isStatus && statusJidList) {
-					participantsList.push(...statusJidList)
-				}
-
-				const additionalDevices = await getUSyncDevices(participantsList, !!useUserDevicesCache, false)
-				devices.push(...additionalDevices)
 
 				if (isGroup) {
 					additionalAttributes = {
@@ -766,15 +848,16 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						!isHostedPnUser(deviceJid) &&
 						device.device !== 99
 					) {
-						//todo: revamp all this logic
-						// the goal is to follow with what I said above for each group, and instead of a true false map of ids, we can set an array full of those the app has already sent pkmsgs
 						senderKeyRecipients.push(deviceJid)
 						senderKeyMap[deviceJid] = true
 					}
 				}
 
 				if (senderKeyRecipients.length) {
-					logger.debug({ senderKeyJids: senderKeyRecipients }, 'sending new sender key')
+					// Ensure sessions are asserted for sender key recipients (should have been covered by allRecipients, but double check cache is fast)
+					// Note: assertSessions here will mostly hit cache since we did it in Phase 1
+					// We keep it here just in case, but it shouldn't block network if cache works
+					await assertSessions(senderKeyRecipients)
 
 					const senderKeyMsg: proto.IMessage = {
 						senderKeyDistributionMessage: {
@@ -782,9 +865,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							groupId: destinationJid
 						}
 					}
-
-					const senderKeySessionTargets = senderKeyRecipients
-					await assertSessions(senderKeySessionTargets)
 
 					const result = await createParticipantNodes(senderKeyRecipients, senderKeyMsg, extraAttrs)
 					shouldIncludeDeviceIdentity = shouldIncludeDeviceIdentity || result.shouldIncludeDeviceIdentity
@@ -800,17 +880,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 				await authState.keys.set({ 'sender-key-memory': { [jid]: senderKeyMap } })
 			} else {
-				// ADDRESSING CONSISTENCY: Match own identity to conversation context
-				// TODO: investigate if this is true
-				let ownId = meId
-				if (isLid && meLid) {
-					ownId = meLid
-					logger.debug({ to: jid, ownId }, 'Using LID identity for @lid conversation')
-				} else {
-					logger.debug({ to: jid, ownId }, 'Using PN identity for @s.whatsapp.net conversation')
-				}
-
-				const { user: ownUser } = jidDecode(ownId)!
+				// 1:1 Messaging
 				if (!participant) {
 					const patchedForReporting = await patchMessageBeforeSending(message, [jid])
 					reportingMessage = Array.isArray(patchedForReporting)
@@ -818,81 +888,10 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						: patchedForReporting
 				}
 
-				if (!isRetryResend) {
-					const targetUserServer = isLid ? 'lid' : 's.whatsapp.net'
-					devices.push({
-						user,
-						device: 0,
-						jid: jidEncode(user, targetUserServer, 0) // rajeh, todo: this entire logic is convoluted and weird.
-					})
-
-					if (user !== ownUser) {
-						const ownUserServer = isLid ? 'lid' : 's.whatsapp.net'
-						const ownUserForAddressing = isLid && meLid ? jidDecode(meLid)!.user : jidDecode(meId)!.user
-
-						devices.push({
-							user: ownUserForAddressing,
-							device: 0,
-							jid: jidEncode(ownUserForAddressing, ownUserServer, 0)
-						})
-					}
-
-					if (additionalAttributes?.['category'] !== 'peer') {
-						// Clear placeholders and enumerate actual devices
-						devices.length = 0
-
-						// Use conversation-appropriate sender identity
-						const senderIdentity =
-							isLid && meLid
-								? jidEncode(jidDecode(meLid)?.user!, 'lid', undefined)
-								: jidEncode(jidDecode(meId)?.user!, 's.whatsapp.net', undefined)
-
-						// Enumerate devices for sender and target with consistent addressing
-						const sessionDevices = await getUSyncDevices([senderIdentity, jid], true, false)
-						devices.push(...sessionDevices)
-
-						logger.debug(
-							{
-								deviceCount: devices.length,
-								devices: devices.map(d => `${d.user}:${d.device}@${jidDecode(d.jid)?.server}`)
-							},
-							'Device enumeration complete with unified addressing'
-						)
-					}
-				}
-
-				const allRecipients: string[] = []
-				const meRecipients: string[] = []
-				const otherRecipients: string[] = []
-				const { user: mePnUser } = jidDecode(meId)!
-				const { user: meLidUser } = meLid ? jidDecode(meLid)! : { user: null }
-
-				for (const { user, jid } of devices) {
-					const isExactSenderDevice = jid === meId || (meLid && jid === meLid)
-					if (isExactSenderDevice) {
-						logger.debug({ jid, meId, meLid }, 'Skipping exact sender device (whatsmeow pattern)')
-						continue
-					}
-
-					// Check if this is our device (could match either PN or LID user)
-					const isMe = user === mePnUser || user === meLidUser
-
-					if (isMe) {
-						meRecipients.push(jid)
-					} else {
-						otherRecipients.push(jid)
-					}
-
-					allRecipients.push(jid)
-				}
-
-				await assertSessions(allRecipients)
-
 				const [
 					{ nodes: meNodes, shouldIncludeDeviceIdentity: s1 },
 					{ nodes: otherNodes, shouldIncludeDeviceIdentity: s2 }
 				] = await Promise.all([
-					// For own devices: use DSM if available (1:1 chats only)
 					createParticipantNodes(meRecipients, meMsg || message, extraAttrs),
 					createParticipantNodes(otherRecipients, message, extraAttrs, meMsg)
 				])
@@ -939,13 +938,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				if (additionalAttributes?.['category'] === 'peer') {
 					const peerNode = participants[0]?.content?.[0] as BinaryNode
 					if (peerNode) {
-						binaryNodeContent.push(peerNode) // push only enc
+						binaryNodeContent.push(peerNode)
 					}
 				} else {
 					binaryNodeContent.push({
 						tag: 'participants',
 						attrs: {},
-
 						content: participants
 					})
 				}
@@ -962,9 +960,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				content: binaryNodeContent
 			}
 
-			// if the participant to send to is explicitly specified (generally retry recp)
-			// ensure the message is only sent to that person
-			// if a retry receipt is sent to everyone -- it'll fail decryption for everyone else who received the msg
 			if (participant) {
 				if (isJidGroup(destinationJid)) {
 					stanza.attrs.to = destinationJid
@@ -985,10 +980,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					attrs: {},
 					content: encodeSignedDeviceIdentity(authState.creds.account!, true)
 				})
-
-				logger.debug({ jid }, 'adding device identity')
 			}
 
+			// Reporting Token Logic (Requires no Network, just CPU)
 			if (
 				!isNewsletter &&
 				!isRetryResend &&
@@ -1006,39 +1000,43 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					const reportingNode = await getMessageReportingToken(encoded, reportingMessage, reportingKey)
 					if (reportingNode) {
 						;(stanza.content as BinaryNode[]).push(reportingNode)
-						logger.trace({ jid }, 'added reporting token to message')
 					}
 				} catch (error: any) {
 					logger.warn({ jid, trace: error?.stack }, 'failed to attach reporting token')
 				}
 			}
 
-			const contactTcTokenData =
-				!isGroup && !isRetryResend && !isStatus ? await authState.keys.get('tctoken', [destinationJid]) : {}
-
-			const tcTokenBuffer = contactTcTokenData[destinationJid]?.token
-
-			if (tcTokenBuffer) {
-				;(stanza.content as BinaryNode[]).push({
-					tag: 'tctoken',
-					attrs: {},
-					content: tcTokenBuffer
-				})
-			}
-
-			if (additionalNodes && additionalNodes.length > 0) {
-				;(stanza.content as BinaryNode[]).push(...additionalNodes)
-			}
-
-			logger.debug({ msgId }, `sending message to ${participants.length} devices`)
-
-			await sendNode(stanza)
-
-			// Add message to retry cache if enabled
-			if (messageRetryManager && !participant) {
-				messageRetryManager.addRecentMessage(destinationJid, msgId, message)
-			}
+			return stanza
 		}, meId)
+
+		// --- PHASE 3: SENDING (NETWORK) ---
+		// Send the stanza outside the transaction.
+		// Other messages can now start their encryption phase while this is waiting for TCP ACK.
+
+		// TCToken is fetched from cache/db, usually fast. We can do it before send.
+		const contactTcTokenData =
+			!isGroupOrStatus && !isRetryResend ? await authState.keys.get('tctoken', [destinationJid]) : {}
+		const tcTokenBuffer = contactTcTokenData[destinationJid]?.token
+
+		if (tcTokenBuffer) {
+			;(stanza.content as BinaryNode[]).push({
+				tag: 'tctoken',
+				attrs: {},
+				content: tcTokenBuffer
+			})
+		}
+
+		if (additionalNodes && additionalNodes.length > 0) {
+			;(stanza.content as BinaryNode[]).push(...additionalNodes)
+		}
+
+		logger.debug({ msgId }, `sending message to ${participants.length} devices`)
+
+		await sendNode(stanza)
+
+		if (messageRetryManager && !participant) {
+			messageRetryManager.addRecentMessage(destinationJid, msgId, message)
+		}
 
 		return msgId
 	}
