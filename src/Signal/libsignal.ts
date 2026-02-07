@@ -171,7 +171,6 @@ export function makeLibSignalRepository(
 		async deleteSession(jids: string[]) {
 			if (!jids.length) return
 
-			// Convert JIDs to signal addresses and prepare for bulk deletion
 			const sessionUpdates: { [key: string]: null } = {}
 			jids.forEach(jid => {
 				const addr = jidToSignalProtocolAddress(jid)
@@ -188,7 +187,11 @@ export function makeLibSignalRepository(
 			fromJid: string,
 			toJid: string
 		): Promise<{ migrated: number; skipped: number; total: number }> {
-			// TODO: use usync to handle this entire mess
+			
+			const pairKey = `pair:${fromJid}->${toJid}`
+			if (migratedSessionCache.has(pairKey)) {
+				return { migrated: 0, skipped: 0, total: 0 }
+			}
 			if (!fromJid || (!isLidUser(toJid) && !isHostedLidUser(toJid))) return { migrated: 0, skipped: 0, total: 0 }
 
 			// Only support PN to LID migration
@@ -250,7 +253,7 @@ export function makeLibSignalRepository(
 			)
 
 			// Single transaction for all migrations
-			return parsedKeys.transaction(
+			const result = await parsedKeys.transaction(
 				async (): Promise<{ migrated: number; skipped: number; total: number }> => {
 					// Prepare migration operations with addressing metadata
 					type MigrationOp = {
@@ -326,6 +329,10 @@ export function makeLibSignalRepository(
 				},
 				`migrate-${deviceJids.length}-sessions-${jidDecode(toJid)?.user}`
 			)
+
+			// Marca el par como ya procesado para evitar reintentos constantes
+			migratedSessionCache.set(pairKey, true)
+			return result
 		}
 	}
 
